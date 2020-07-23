@@ -14,12 +14,14 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
 using System.Text.RegularExpressions;
+using Newtonsoft.Json;
 
 namespace Build
 {
     public static class BuildSteps
     {
         private static readonly string _wwwroot = Environment.ExpandEnvironmentVariables(@"%HOME%\site\wwwroot");
+        private static IntegrationTestBuildManifest _manifest;
 
         public static void Clean()
         {
@@ -42,6 +44,51 @@ namespace Build
             .Aggregate(string.Empty, (a, b) => $"{a} --source {b}");
 
             Shell.Run("dotnet", $"restore {Settings.ProjectFile} {feeds}");
+        }
+
+        public static void UpdatePackageVersionsForIntegrationTests()
+        {
+            if (string.IsNullOrEmpty(Settings.IntegrationBuildNumber))
+            {
+                ColoredConsole.Error.WriteLine($"Environment variable 'integrationBuildNumber' cannot be null or empty for an integration build.");
+            }
+
+            var feed = "https://azfunc.pkgs.visualstudio.com/e6a70c92-4128-439f-8012-382fe78d6396/_packaging/AzureFunctionsPreRelease/nuget/v3/index.json";
+
+            var workersToUpdate = GetV3PackageList();
+            string currentDirectory = null;
+
+            Dictionary<string, string> buildPackages = new Dictionary<string, string>();
+
+            _manifest = new IntegrationTestBuildManifest();
+
+            try
+            {
+                currentDirectory = Directory.GetCurrentDirectory();
+                var projectFolder = Path.GetFullPath(Settings.SrcProjectPath);
+                Directory.SetCurrentDirectory(projectFolder);
+
+                foreach (var workerName in workersToUpdate)
+                {
+                    string packageInfo = Shell.GetOutput("NuGet", $"list {workerName} -Source {feed}").Split(Environment.NewLine)[0];
+                    var parts = packageInfo.Split(" ");
+                    var packageName = parts[0];
+                    var workerVersion = parts[1];
+
+                    buildPackages.Add(packageName, workerVersion);
+
+                    Shell.Run("dotnet", $"add package {packageName} -v {workerVersion} -s {feed}");
+                }
+            }
+            finally
+            {
+                if (buildPackages.Count > 0)
+                {
+                    _manifest.Packages = buildPackages;
+                }
+
+                Directory.SetCurrentDirectory(currentDirectory);
+            }
         }
 
         public static void ReplaceTelemetryInstrumentationKey()
@@ -78,11 +125,13 @@ namespace Build
         {
             foreach (var runtime in Settings.TargetRuntimes)
             {
+                var buildNumber = Settings.BuildNumber;
                 var outputPath = Path.Combine(Settings.OutputDir, runtime);
                 var rid = GetRuntimeId(runtime);
                 Shell.Run("dotnet", $"publish {Settings.ProjectFile} " +
-                                    $"/p:BuildNumber=\"{Settings.BuildNumber}\" " +
+                                    $"/p:BuildNumber=\"{buildNumber}\" " +
                                     $"/p:CommitHash=\"{Settings.CommitId}\" " +
+                                    (string.IsNullOrEmpty(Settings.IntegrationBuildNumber) ? string.Empty : $"/p:IntegrationBuildNumber=\"{Settings.IntegrationBuildNumber}\" ") +
                                     $"-o {outputPath} -c Release " +
                                     (string.IsNullOrEmpty(rid) ? string.Empty : $" -r {rid}"));
 
@@ -416,6 +465,7 @@ namespace Build
         public static void Zip()
         {
             var version = CurrentVersion;
+
             foreach (var runtime in Settings.TargetRuntimes)
             {
                 var path = Path.Combine(Settings.OutputDir, runtime);
@@ -544,5 +594,52 @@ namespace Build
                 }
             }
         }
+
+        public static void WritenItegrationTestBuildManifest()
+        {
+            if (!string.IsNullOrEmpty(Settings.IntegrationBuildNumber))
+            {
+                if (_manifest == null)
+                {
+                    // This should never be the case. This class gets initialize in UpdatePackageVersionsForIntegrationTests.
+                    _manifest = new IntegrationTestBuildManifest();
+                }
+
+                _manifest.CoreToolsVersion = _version;
+                _manifest.Build = Settings.IntegrationBuildNumber;
+
+                var json = JsonConvert.SerializeObject(_manifest, Formatting.Indented);
+                var manifestFilePath = Path.Combine(Settings.OutputDir, "integrationTestBuildManifest.json");
+                File.WriteAllText(manifestFilePath, json);
+            }
+        }
+
+        private static List<string> GetV3PackageList()
+        {
+            var filePath = "https://raw.githubusercontent.com/Azure/azure-functions-integration-tests/main/integrationTestsBuild/V3/CoreToolsBuild.json";
+            Uri address = new Uri(filePath);
+
+            string content = null;
+            using (var client = new WebClient())
+            {
+                content = client.DownloadString(address);
+            }
+
+            if (string.IsNullOrEmpty(content))
+            {
+                ColoredConsole.Error.WriteLine($"Failed to download package list from {filePath}");
+            }
+
+            var packageList = JsonConvert.DeserializeObject<List<string>>(content);
+
+            return packageList;
+        }
+    }
+
+    class IntegrationTestBuildManifest
+    {
+        public string Build { get; set; }
+        public Dictionary<string, string> Packages { get; set; }
+        public string CoreToolsVersion { get; set; }
     }
 }
